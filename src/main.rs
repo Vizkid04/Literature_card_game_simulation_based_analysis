@@ -1,13 +1,13 @@
 use plotters::prelude::*;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
-use std::collections::HashSet;
 use std::time::Instant;
 
 const TOTAL_CARDS: usize = 48;
 const CARDS_PER_HALF_SUIT: usize = 6;
 const NUM_HALF_SUITS: usize = 8;
 const MAX_TURNS: usize = 1000;
+const ALL_CARDS_MASK: u64 = (1u64 << TOTAL_CARDS) - 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Possibility {
@@ -20,9 +20,11 @@ pub enum Possibility {
 pub struct BotMemory {
     pub player_id: usize,
     pub num_players: usize,
-    pub matrix: Vec<Vec<Possibility>>,
-    pub hand_sizes: Vec<usize>,
-    pub suit_interest: Vec<Vec<usize>>,
+    pub has_mask: Vec<u64>,
+    pub does_not_have_mask: Vec<u64>,
+    pub hand_sizes: Vec<u8>,
+    pub suit_interest: Vec<[u8; NUM_HALF_SUITS]>,
+    pub asked_suit_mask: Vec<u8>,
 }
 
 impl BotMemory {
@@ -30,74 +32,106 @@ impl BotMemory {
         Self {
             player_id,
             num_players,
-            matrix: vec![vec![Possibility::Unknown; TOTAL_CARDS]; num_players],
+            has_mask: vec![0; num_players],
+            does_not_have_mask: vec![0; num_players],
             hand_sizes: vec![0; num_players],
-            suit_interest: vec![vec![0; NUM_HALF_SUITS]; num_players],
+            suit_interest: vec![[0; NUM_HALF_SUITS]; num_players],
+            asked_suit_mask: vec![0; num_players],
         }
     }
 
     pub fn memory_bytes(&self) -> usize {
-        let struct_size = std::mem::size_of::<Self>();
-        let matrix_heap = self.matrix.capacity() * std::mem::size_of::<Vec<Possibility>>()
-            + self.matrix.iter().map(|v| v.capacity() * std::mem::size_of::<Possibility>()).sum::<usize>();
-        let hand_sizes_heap = self.hand_sizes.capacity() * std::mem::size_of::<usize>();
-        let suit_interest_heap = self.suit_interest.capacity() * std::mem::size_of::<Vec<usize>>()
-            + self.suit_interest.iter().map(|v| v.capacity() * std::mem::size_of::<usize>()).sum::<usize>();
-
-        struct_size + matrix_heap + hand_sizes_heap + suit_interest_heap
+        std::mem::size_of::<Self>()
+            + self.has_mask.capacity() * std::mem::size_of::<u64>()
+            + self.does_not_have_mask.capacity() * std::mem::size_of::<u64>()
+            + self.hand_sizes.capacity() * std::mem::size_of::<u8>()
+            + self.suit_interest.capacity() * std::mem::size_of::<[u8; NUM_HALF_SUITS]>()
+            + self.asked_suit_mask.capacity() * std::mem::size_of::<u8>()
     }
 
-    pub fn initialize_hand(&mut self, hand: &HashSet<usize>, hand_sizes: &[usize]) {
-        self.hand_sizes = hand_sizes.to_vec();
-        for card in 0..TOTAL_CARDS {
-            if hand.contains(&card) {
-                self.matrix[self.player_id][card] = Possibility::Has;
-                for p in 0..self.num_players {
-                    if p != self.player_id {
-                        self.matrix[p][card] = Possibility::DoesNotHave;
-                    }
-                }
-            } else {
-                self.matrix[self.player_id][card] = Possibility::DoesNotHave;
+    pub fn initialize_hand(&mut self, hand: u64, hand_sizes: &[usize]) {
+        self.hand_sizes = hand_sizes.iter().map(|&s| s as u8).collect();
+        self.has_mask[self.player_id] = hand;
+        self.does_not_have_mask[self.player_id] = !hand & ALL_CARDS_MASK;
+
+        for p in 0..self.num_players {
+            if p != self.player_id {
+                self.does_not_have_mask[p] |= hand;
             }
         }
     }
 
-    pub fn run_deductions_with_active(&mut self, active_cards: &[bool]) -> usize {
+    pub fn run_deductions_with_active(&mut self, active_cards: u64) -> usize {
         let mut total_ops = 0;
         let mut changed = true;
         let mut passes = 0;
 
-        while changed && passes < 50 {
+        while changed && passes < 20 {
             changed = false;
             passes += 1;
 
+            // 1. Single Candidate Rule & Cross Exclusion
             for c in 0..TOTAL_CARDS {
-                if !active_cards[c] { continue; }
-                let possible: Vec<usize> = (0..self.num_players)
-                    .filter(|&p| self.matrix[p][c] != Possibility::DoesNotHave)
-                    .collect();
-                total_ops += self.num_players;
+                let card_bit = 1u64 << c;
+                if (active_cards & card_bit) == 0 {
+                    continue;
+                }
 
-                if possible.len() == 1 {
-                    let holder = possible[0];
-                    if self.matrix[holder][c] != Possibility::Has {
-                        self.matrix[holder][c] = Possibility::Has;
+                let mut possible_count = 0;
+                let mut last_possible = 0;
+
+                for p in 0..self.num_players {
+                    total_ops += 1;
+                    if (self.has_mask[p] & card_bit) != 0 {
+                        for o in 0..self.num_players {
+                            if o != p && (self.does_not_have_mask[o] & card_bit) == 0 {
+                                self.does_not_have_mask[o] |= card_bit;
+                                changed = true;
+                            }
+                        }
+                        possible_count = 0;
+                        break;
+                    }
+
+                    if (self.does_not_have_mask[p] & card_bit) == 0 {
+                        possible_count += 1;
+                        last_possible = p;
+                    }
+                }
+
+                if possible_count == 1 && (self.has_mask[last_possible] & card_bit) == 0 {
+                    self.has_mask[last_possible] |= card_bit;
+                    changed = true;
+                }
+            }
+
+            // 2. Hand Size Exhaustion Rule
+            for p in 0..self.num_players {
+                total_ops += 1;
+                let known_has = (self.has_mask[p] & active_cards).count_ones() as u8;
+                if known_has == self.hand_sizes[p] {
+                    let unknown_mask = active_cards & !self.has_mask[p];
+                    if (self.does_not_have_mask[p] & unknown_mask) != unknown_mask {
+                        self.does_not_have_mask[p] |= unknown_mask;
                         changed = true;
                     }
                 }
             }
 
+            // 3. Suit Interest Constraint: Asker must hold at least 1 card in asked suit
             for p in 0..self.num_players {
-                let known_has_count = (0..TOTAL_CARDS)
-                    .filter(|&c| active_cards[c] && self.matrix[p][c] == Possibility::Has)
-                    .count();
-                total_ops += TOTAL_CARDS;
+                for hs in 0..NUM_HALF_SUITS {
+                    total_ops += 1;
+                    if (self.asked_suit_mask[p] & (1 << hs)) != 0 {
+                        let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+                        let active_hs = hs_mask & active_cards;
+                        if active_hs == 0 || (self.has_mask[p] & active_hs) != 0 {
+                            continue;
+                        }
 
-                if known_has_count == self.hand_sizes[p] {
-                    for c in 0..TOTAL_CARDS {
-                        if active_cards[c] && self.matrix[p][c] == Possibility::Unknown {
-                            self.matrix[p][c] = Possibility::DoesNotHave;
+                        let candidates = active_hs & !self.does_not_have_mask[p];
+                        if candidates.count_ones() == 1 && (self.has_mask[p] & candidates) == 0 {
+                            self.has_mask[p] |= candidates;
                             changed = true;
                         }
                     }
@@ -107,55 +141,74 @@ impl BotMemory {
         total_ops
     }
 
-    pub fn record_ask(&mut self, asker: usize, target: usize, card: usize, success: bool, active_cards: &[bool]) -> usize {
+    pub fn record_ask(&mut self, asker: usize, target: usize, card: usize, success: bool, active_cards: u64) -> usize {
         let suit = card / CARDS_PER_HALF_SUIT;
-        self.suit_interest[asker][suit] += 1;
+        let card_bit = 1u64 << card;
+
+        self.suit_interest[asker][suit] = self.suit_interest[asker][suit].saturating_add(1);
+        self.asked_suit_mask[asker] |= 1 << suit;
+        self.does_not_have_mask[asker] |= card_bit;
 
         if success {
-            self.matrix[asker][card] = Possibility::Has;
-            self.matrix[target][card] = Possibility::DoesNotHave;
+            self.has_mask[asker] |= card_bit;
+            self.does_not_have_mask[asker] &= !card_bit;
+            self.does_not_have_mask[target] |= card_bit;
+            self.has_mask[target] &= !card_bit;
+
             self.hand_sizes[asker] += 1;
             if self.hand_sizes[target] > 0 {
                 self.hand_sizes[target] -= 1;
             }
         } else {
-            self.matrix[asker][card] = Possibility::DoesNotHave;
-            self.matrix[target][card] = Possibility::DoesNotHave;
+            self.does_not_have_mask[target] |= card_bit;
         }
 
         self.run_deductions_with_active(active_cards)
     }
 
-    pub fn record_claim(&mut self, hs: usize, active_cards: &[bool]) -> usize {
-        let start = hs * CARDS_PER_HALF_SUIT;
-        for c in start..(start + CARDS_PER_HALF_SUIT) {
-            for p in 0..self.num_players {
-                self.matrix[p][c] = Possibility::DoesNotHave;
-            }
+    pub fn record_claim(&mut self, hs: usize, active_cards: u64) -> usize {
+        let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+        for p in 0..self.num_players {
+            self.has_mask[p] &= !hs_mask;
+            self.does_not_have_mask[p] |= hs_mask;
         }
         self.run_deductions_with_active(active_cards)
     }
 
-    pub fn evaluate_best_ask(&self, my_hand: &HashSet<usize>, active_cards: &[bool]) -> Option<(usize, usize, f64)> {
+    pub fn evaluate_best_ask(&self, my_hand: u64, active_cards: u64) -> Option<(usize, usize, f64)> {
         let my_team = self.player_id % 2;
         let mut best_move = None;
         let mut max_score = -1.0;
 
-        let my_half_suits: HashSet<usize> = my_hand.iter().map(|&c| c / CARDS_PER_HALF_SUIT).collect();
+        for hs in 0..NUM_HALF_SUITS {
+            let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+            if (my_hand & hs_mask) == 0 {
+                continue;
+            }
 
-        for &hs in &my_half_suits {
             let start = hs * CARDS_PER_HALF_SUIT;
-            for c in start..(start + CARDS_PER_HALF_SUIT) {
-                if my_hand.contains(&c) || !active_cards[c] { continue; }
+            for c_offset in 0..CARDS_PER_HALF_SUIT {
+                let c = start + c_offset;
+                let card_bit = 1u64 << c;
+
+                if (my_hand & card_bit) != 0 || (active_cards & card_bit) == 0 {
+                    continue;
+                }
 
                 for target in 0..self.num_players {
-                    if target % 2 == my_team || self.hand_sizes[target] == 0 { continue; }
+                    if target % 2 == my_team || self.hand_sizes[target] == 0 {
+                        continue;
+                    }
 
-                    let status = self.matrix[target][c];
-                    let score = match status {
-                        Possibility::Has => 100.0,
-                        Possibility::DoesNotHave => -100.0,
-                        Possibility::Unknown => 1.0 + (self.suit_interest[target][hs] as f64) * 2.0,
+                    let known_has = (self.has_mask[target] & card_bit) != 0;
+                    let known_not_has = (self.does_not_have_mask[target] & card_bit) != 0;
+
+                    let score = if known_has {
+                        1000.0
+                    } else if known_not_has {
+                        -1000.0
+                    } else {
+                        1.0 + (self.suit_interest[target][hs] as f64) * 5.0 + (self.hand_sizes[target] as f64) * 0.5
                     };
 
                     if score > max_score && score > 0.0 {
@@ -168,21 +221,29 @@ impl BotMemory {
         best_move
     }
 
-    pub fn evaluate_claim_risk(&self, hs: usize, my_hand: &HashSet<usize>, active_cards: &[bool]) -> Option<Vec<(usize, usize)>> {
-        let start = hs * CARDS_PER_HALF_SUIT;
-        let active_hs_cards: Vec<usize> = (start..(start + CARDS_PER_HALF_SUIT)).filter(|&c| active_cards[c]).collect();
+    pub fn evaluate_claim_risk(&self, hs: usize, my_hand: u64, active_cards: u64) -> Option<Vec<(usize, usize)>> {
+        let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+        let active_hs = hs_mask & active_cards;
 
-        if active_hs_cards.is_empty() || !active_hs_cards.iter().any(|c| my_hand.contains(c)) {
+        if active_hs == 0 || (my_hand & active_hs) == 0 {
             return None;
         }
 
-        let mut declaration = Vec::new();
+        let start = hs * CARDS_PER_HALF_SUIT;
+        let mut declaration = Vec::with_capacity(CARDS_PER_HALF_SUIT);
 
-        for &c in &active_hs_cards {
-            if my_hand.contains(&c) {
+        for c_offset in 0..CARDS_PER_HALF_SUIT {
+            let c = start + c_offset;
+            let card_bit = 1u64 << c;
+
+            if (active_cards & card_bit) == 0 {
+                continue;
+            }
+
+            if (my_hand & card_bit) != 0 {
                 declaration.push((c, self.player_id));
             } else {
-                let owner = (0..self.num_players).find(|&p| self.matrix[p][c] == Possibility::Has);
+                let owner = (0..self.num_players).find(|&p| (self.has_mask[p] & card_bit) != 0);
                 if let Some(p) = owner {
                     declaration.push((c, p));
                 } else {
@@ -191,16 +252,20 @@ impl BotMemory {
             }
         }
 
-        if declaration.len() == active_hs_cards.len() { Some(declaration) } else { None }
+        if declaration.len() == active_hs.count_ones() as usize {
+            Some(declaration)
+        } else {
+            None
+        }
     }
 }
 
 pub struct LiteratureGame {
     pub num_players: usize,
-    pub hands: Vec<HashSet<usize>>,
+    pub hands: Vec<u64>,
     pub bots: Vec<BotMemory>,
-    pub active_cards: Vec<bool>,
-    pub half_suit_claimed: Vec<bool>,
+    pub active_cards: u64,
+    pub half_suit_claimed: u8,
     pub team_scores: [usize; 2],
     pub current_player: usize,
     pub turns: usize,
@@ -212,25 +277,26 @@ impl LiteratureGame {
         let mut deck: Vec<usize> = (0..TOTAL_CARDS).collect();
         deck.shuffle(&mut rng);
 
-        let mut hands = vec![HashSet::new(); num_players];
+        let mut hands = vec![0u64; num_players];
         for (i, &card) in deck.iter().enumerate() {
-            hands[i % num_players].insert(card);
+            hands[i % num_players] |= 1u64 << card;
         }
 
-        let hand_sizes: Vec<usize> = hands.iter().map(|h| h.len()).collect();
-        let mut bots = vec![BotMemory::new(0, num_players); num_players];
+        let hand_sizes: Vec<usize> = hands.iter().map(|h| h.count_ones() as usize).collect();
+        let mut bots = Vec::with_capacity(num_players);
 
         for i in 0..num_players {
-            bots[i] = BotMemory::new(i, num_players);
-            bots[i].initialize_hand(&hands[i], &hand_sizes);
+            let mut bot = BotMemory::new(i, num_players);
+            bot.initialize_hand(hands[i], &hand_sizes);
+            bots.push(bot);
         }
 
         Self {
             num_players,
             hands,
             bots,
-            active_cards: vec![true; TOTAL_CARDS],
-            half_suit_claimed: vec![false; NUM_HALF_SUITS],
+            active_cards: ALL_CARDS_MASK,
+            half_suit_claimed: 0,
             team_scores: [0, 0],
             current_player: 0,
             turns: 0,
@@ -245,11 +311,11 @@ impl LiteratureGame {
         let team = start % 2;
         for i in 0..self.num_players {
             let cand = (start + i) % self.num_players;
-            if cand % 2 == team && !self.hands[cand].is_empty() {
+            if cand % 2 == team && self.hands[cand] != 0 {
                 return Some(cand);
             }
         }
-        (0..self.num_players).find(|&p| !self.hands[p].is_empty())
+        (0..self.num_players).find(|&p| self.hands[p] != 0)
     }
 
     pub fn play_step(&mut self) -> usize {
@@ -257,7 +323,7 @@ impl LiteratureGame {
         self.turns += 1;
 
         let mut p = self.current_player;
-        if self.hands[p].is_empty() {
+        if self.hands[p] == 0 {
             if let Some(nxt) = self.get_next_player(p) {
                 self.current_player = nxt;
                 p = nxt;
@@ -267,22 +333,25 @@ impl LiteratureGame {
         }
 
         let my_team = p % 2;
-        let opponents_have_cards = (0..self.num_players).any(|o| o % 2 != my_team && !self.hands[o].is_empty());
+        let opponents_have_cards = (0..self.num_players).any(|o| o % 2 != my_team && self.hands[o] != 0);
 
         if !opponents_have_cards {
             for hs in 0..NUM_HALF_SUITS {
-                if !self.half_suit_claimed[hs] {
-                    self.half_suit_claimed[hs] = true;
+                if (self.half_suit_claimed & (1 << hs)) == 0 {
+                    self.half_suit_claimed |= 1 << hs;
                     self.team_scores[my_team] += 1;
                 }
             }
             return ops;
         }
 
+        // 1. Evaluate safe claims
         for hs in 0..NUM_HALF_SUITS {
-            if self.half_suit_claimed[hs] { continue; }
-            if let Some(claim) = self.bots[p].evaluate_claim_risk(hs, &self.hands[p], &self.active_cards) {
-                let is_correct = claim.iter().all(|&(card, owner)| self.hands[owner].contains(&card));
+            if (self.half_suit_claimed & (1 << hs)) != 0 {
+                continue;
+            }
+            if let Some(claim) = self.bots[p].evaluate_claim_risk(hs, self.hands[p], self.active_cards) {
+                let is_correct = claim.iter().all(|&(card, owner)| (self.hands[owner] & (1u64 << card)) != 0);
                 let claiming_team = p % 2;
 
                 if is_correct {
@@ -291,31 +360,33 @@ impl LiteratureGame {
                     self.team_scores[1 - claiming_team] += 1;
                 }
 
-                self.half_suit_claimed[hs] = true;
-                let start = hs * CARDS_PER_HALF_SUIT;
-                for c in start..(start + CARDS_PER_HALF_SUIT) {
-                    self.active_cards[c] = false;
-                    for hand in self.hands.iter_mut() {
-                        hand.remove(&c);
-                    }
+                self.half_suit_claimed |= 1 << hs;
+                let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+                self.active_cards &= !hs_mask;
+
+                for hand in self.hands.iter_mut() {
+                    *hand &= !hs_mask;
                 }
 
                 for bot in self.bots.iter_mut() {
-                    ops += bot.record_claim(hs, &self.active_cards);
+                    ops += bot.record_claim(hs, self.active_cards);
                 }
                 return ops;
             }
         }
 
-        if let Some((target, card, _)) = self.bots[p].evaluate_best_ask(&self.hands[p], &self.active_cards) {
-            let success = self.hands[target].contains(&card);
+        // 2. Evaluate optimal asking strategy
+        if let Some((target, card, _)) = self.bots[p].evaluate_best_ask(self.hands[p], self.active_cards) {
+            let card_bit = 1u64 << card;
+            let success = (self.hands[target] & card_bit) != 0;
+
             if success {
-                self.hands[target].remove(&card);
-                self.hands[p].insert(card);
+                self.hands[target] &= !card_bit;
+                self.hands[p] |= card_bit;
             }
 
             for bot in self.bots.iter_mut() {
-                ops += bot.record_ask(p, target, card, success, &self.active_cards);
+                ops += bot.record_ask(p, target, card, success, self.active_cards);
             }
 
             if !success {
@@ -324,68 +395,101 @@ impl LiteratureGame {
             return ops;
         }
 
-        let my_hand: Vec<usize> = self.hands[p].iter().copied().collect();
-        if !my_hand.is_empty() {
-            let my_suits: HashSet<usize> = my_hand.iter().map(|&c| c / CARDS_PER_HALF_SUIT).collect();
+        // 3. Fallback ask
+        let my_hand = self.hands[p];
+        if my_hand != 0 {
+            for hs in 0..NUM_HALF_SUITS {
+                let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+                if (my_hand & hs_mask) == 0 {
+                    continue;
+                }
 
-            for hs in my_suits {
                 let start = hs * CARDS_PER_HALF_SUIT;
-                let missing: Vec<usize> = (start..(start + CARDS_PER_HALF_SUIT))
-                    .filter(|&c| !self.hands[p].contains(&c) && self.active_cards[c])
-                    .collect();
+                for c_offset in 0..CARDS_PER_HALF_SUIT {
+                    let c = start + c_offset;
+                    let card_bit = 1u64 << c;
 
-                for c in missing {
-                    let candidates: Vec<usize> = (0..self.num_players)
-                        .filter(|&o| o % 2 != p % 2 && !self.hands[o].is_empty() && self.bots[p].matrix[o][c] != Possibility::DoesNotHave)
-                        .collect();
+                    if (my_hand & card_bit) != 0 || (self.active_cards & card_bit) == 0 {
+                        continue;
+                    }
 
-                    if let Some(&target) = candidates.first() {
-                        let success = self.hands[target].contains(&c);
-                        if success {
-                            self.hands[target].remove(&c);
-                            self.hands[p].insert(c);
+                    for o in 0..self.num_players {
+                        if o % 2 != my_team && self.hands[o] != 0 && (self.bots[p].does_not_have_mask[o] & card_bit) == 0 {
+                            let success = (self.hands[o] & card_bit) != 0;
+                            if success {
+                                self.hands[o] &= !card_bit;
+                                self.hands[p] |= card_bit;
+                            }
+
+                            for bot in self.bots.iter_mut() {
+                                ops += bot.record_ask(p, o, c, success, self.active_cards);
+                            }
+
+                            if !success {
+                                self.current_player = o;
+                            }
+                            return ops;
                         }
-                        for bot in self.bots.iter_mut() {
-                            ops += bot.record_ask(p, target, c, success, &self.active_cards);
-                        }
-                        if !success {
-                            self.current_player = target;
-                        }
-                        return ops;
                     }
                 }
             }
 
-            for hs in (0..NUM_HALF_SUITS).filter(|&hs| !self.half_suit_claimed[hs]) {
-                if my_hand.iter().any(|&c| c / CARDS_PER_HALF_SUIT == hs) {
-                    let start = hs * CARDS_PER_HALF_SUIT;
-                    let hs_cards: Vec<usize> = (start..(start + CARDS_PER_HALF_SUIT)).filter(|&c| self.active_cards[c]).collect();
-                    let mut guess_map = Vec::new();
+            // 4. Last resort guess claim
+            for hs in 0..NUM_HALF_SUITS {
+                if (self.half_suit_claimed & (1 << hs)) != 0 {
+                    continue;
+                }
 
-                    for &c in &hs_cards {
-                        if self.hands[p].contains(&c) {
-                            guess_map.push((c, p));
-                        } else {
-                            let candidate = (0..self.num_players).find(|&o| !self.hands[o].is_empty() && self.bots[p].matrix[o][c] != Possibility::DoesNotHave)
-                                .or_else(|| (0..self.num_players).find(|&o| o % 2 == my_team && !self.hands[o].is_empty()))
-                                .or_else(|| (0..self.num_players).find(|&o| !self.hands[o].is_empty()));
-                            if let Some(owner) = candidate {
-                                guess_map.push((c, owner));
-                            }
-                        }
+                let hs_mask = 0x3Fu64 << (hs * CARDS_PER_HALF_SUIT);
+                if (my_hand & hs_mask) == 0 {
+                    continue;
+                }
+
+                let start = hs * CARDS_PER_HALF_SUIT;
+                let mut guess_map = Vec::with_capacity(CARDS_PER_HALF_SUIT);
+
+                for c_offset in 0..CARDS_PER_HALF_SUIT {
+                    let c = start + c_offset;
+                    let card_bit = 1u64 << c;
+
+                    if (self.active_cards & card_bit) == 0 {
+                        continue;
                     }
 
-                    if guess_map.len() == hs_cards.len() {
-                        let is_correct = guess_map.iter().all(|&(card, owner)| self.hands[owner].contains(&card));
-                        if is_correct { self.team_scores[my_team] += 1; } else { self.team_scores[1 - my_team] += 1; }
-                        self.half_suit_claimed[hs] = true;
-                        for c in start..(start + CARDS_PER_HALF_SUIT) {
-                            self.active_cards[c] = false;
-                            for hand in self.hands.iter_mut() { hand.remove(&c); }
+                    if (my_hand & card_bit) != 0 {
+                        guess_map.push((c, p));
+                    } else {
+                        let candidate = (0..self.num_players)
+                            .find(|&o| self.hands[o] != 0 && (self.bots[p].does_not_have_mask[o] & card_bit) == 0)
+                            .or_else(|| (0..self.num_players).find(|&o| o % 2 == my_team && self.hands[o] != 0))
+                            .or_else(|| (0..self.num_players).find(|&o| self.hands[o] != 0));
+
+                        if let Some(owner) = candidate {
+                            guess_map.push((c, owner));
                         }
-                        for bot in self.bots.iter_mut() { ops += bot.record_claim(hs, &self.active_cards); }
-                        return ops;
                     }
+                }
+
+                let active_hs = hs_mask & self.active_cards;
+                if guess_map.len() == active_hs.count_ones() as usize {
+                    let is_correct = guess_map.iter().all(|&(card, owner)| (self.hands[owner] & (1u64 << card)) != 0);
+                    if is_correct {
+                        self.team_scores[my_team] += 1;
+                    } else {
+                        self.team_scores[1 - my_team] += 1;
+                    }
+
+                    self.half_suit_claimed |= 1 << hs;
+                    self.active_cards &= !hs_mask;
+
+                    for hand in self.hands.iter_mut() {
+                        *hand &= !hs_mask;
+                    }
+
+                    for bot in self.bots.iter_mut() {
+                        ops += bot.record_claim(hs, self.active_cards);
+                    }
+                    return ops;
                 }
             }
         }
@@ -462,7 +566,7 @@ where
     root.fill(&WHITE)?;
 
     let min_n = results.first().map(|r| r.n as u32).unwrap_or(4);
-    let max_n = results.last().map(|r| r.n as u32).unwrap_or(16);
+    let max_n = results.last().map(|r| r.n as u32).unwrap_or(60);
     let max_y = results.iter().map(&extractor).fold(0.0f64, f64::max) * 1.15;
 
     let mut chart = ChartBuilder::on(&root)
@@ -547,11 +651,11 @@ fn generate_vector_graphs(results: &[BenchmarkMetrics]) -> Result<(), Box<dyn st
 }
 
 fn main() {
-    let player_counts = vec![4, 6, 8, 10, 12, 14, 16];
+    let player_counts = vec![4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60];
     let iterations = 100;
 
     println!(" ===================================================================================================== ");
-    println!("  RUNNING LITERATURE GAME COMPLEXITY BENCHMARK (100 Iterations per Player Count) ");
+    println!("   RUNNING LITERATURE GAME COMPLEXITY BENCHMARK (100 Iterations per Player Count) ");
     println!(" ===================================================================================================== \n");
 
     let table_border = " +-----+------------+-------------------+--------------------+------------------+-------------------+--------------------+ ";
